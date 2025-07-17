@@ -142,7 +142,6 @@ def get_1d_mask(offs, max) -> tensor:
 def get_2d_mask(offs_0, offs_1, max_0, max_1):
     return (tl.expand_dims(offs_0, 1) < max_0) & (tl.expand_dims(offs_1, 0) < max_1)
 
-
 @triton.jit
 def matmul_kernel(a_ptr, b_ptr, c_ptr, m, n, k, bs:tl.constexpr):
     pid_m = tl.program_id(0)
@@ -161,7 +160,6 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, m, n, k, bs:tl.constexpr):
     acc = tl.zeros((bs, bs), dtype=tl.float32)
     
     for _ in range(0, k, bs):
-        # A máscara provavelmente não é necessária sse bs divide k
         a = tl.load(indexes_a)
         b = tl.load(indexes_b)
 
@@ -172,98 +170,38 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, m, n, k, bs:tl.constexpr):
 
     indexes_c = c_ptr + get_2d_offset(offs_m, offs_n, num_columns = n)
     mask = get_2d_mask(offs_m, offs_n, m, n)
-    tl.store(indexes_c, acc, mask) 
+    tl.store(indexes_c, acc, mask=mask) 
 
 def matmul(a, b, bs):
     assert a.shape[1] == b.shape[0], "Linha precisa ter o mesmo tamanho de colunas"
+    check_tensors_gpu_ready(a, b)
     m, n, k = a.shape[0], b.shape[0], a.shape[1]
-    c = torch.zeros((m, n), device='cuda')
+    c = torch.empty((m, n), device='cuda', dtype=torch.float16)
     grid = (cdiv(m, bs), cdiv(n, bs))
     matmul_kernel[grid](a, b, c, m, n, k, bs)
     return c
 
-# a = tensor([[1, 2], [3, 4]], dtype=torch.float32, device = 'cuda')
-# b = tensor([[5, 6], [7, 8]], dtype=torch.float32, device = 'cuda')
+# Teste pequeno:
+a = tensor([[1, 2], [3, 4]], dtype=torch.float32, device = 'cuda')
+b = tensor([[5, 6], [7, 8]], dtype=torch.float32, device = 'cuda')
 
-# print(matmul(a, b, 16))
+# Output : [[19, 22],
+#           [43, 50]]
+print(matmul(a, b, 16))
 
-#@triton.jit
-#def get_1d_offset(size, n_prev_chunks):
-#    return n_prev_chunks * size + tl.arange(0, size)
-#
-#@triton.jit
-#def get_2d_offset(offs_0, offs_1, stride_0): 
-#    return tl.expand_dims(offs_0, 1)*stride_0 + tl.expand_dims(offs_1, 0)
-#
-#@triton.jit
-#def get_1d_mask(offs, max):
-#    return offs < max
-#
-#@triton.jit
-#def get_2d_mask(offs_0, offs_1, max_0, max_1):
-#    return (tl.expand_dims(offs_0, 1) < max_0) & (tl.expand_dims(offs_1, 0) < max_1)
-#
-#@triton.jit
-#def naive_matmul_k(
-#    a_ptr, b_ptr, c_ptr,
-#    m, n, k,
-#    bs:tl.constexpr
-#):
-#    pid_m, pid_n = tl.program_id(0), tl.program_id(1)
-#    # chunks along m/n/k dimensions
-#    rm = get_1d_offset(size=bs, n_prev_chunks=pid_m)
-#    rn = get_1d_offset(size=bs, n_prev_chunks=pid_n)
-#    rk = get_1d_offset(size=bs, n_prev_chunks=0)
-#    # relevant offsets of a, b
-#    offs_a = a_ptr + get_2d_offset(rm, rk, k)
-#    offs_b = b_ptr + get_2d_offset(rk, rn, n)
-#    # initialize and iteratively update accumulator
-#    acc = tl.zeros((bs, bs), dtype=tl.float32)
-#    for _ in range(0, k, bs):
-#        # todo umer: don't we need mask when loading a & b?
-#        a = tl.load(offs_a)
-#        b = tl.load(offs_b)
-#        acc += tl.dot(a, b, allow_tf32=False) # matmul in block ; Weirdness: allow_tf32 must be set to False for older GPUs, otherwise won't compile
-#        # increase offets, so next iteration loads next chunks
-#        offs_a += bs 
-#        offs_b += bs * n
-#    c = c_ptr + get_2d_offset(rm, rn, n)
-#    mask = get_2d_mask(rm, rn, m, n)
-#    tl.store(c, acc, mask=mask)
-#
-#from functools import partial
-#
-#def matmul(a, b, bs=16):
-#    assert a.shape[1] == b.shape[0], "matrix dims not compatible for matmul"
-#    check_tensors_gpu_ready(a, b)
-#    (m, k), (_, n) = a.shape, b.shape
-#    c = torch.empty((m, n), device=a.device, dtype=torch.float16)
-#    grid = (cdiv(m, bs), cdiv(n, bs))
-#    naive_matmul_k[grid](
-#        a, b, c,
-#        m, n, k,
-#        bs
-#    )
-#    return c
-
-# naive_matmul = partial(matmul, matmul_k_fn=naive_matmul_k)
-
-# a = torch.ones((3, 4), dtype=torch.float32, device='cuda')
-# b = torch.ones((4, 5), dtype=torch.float32, device='cuda')
-# 
-# print(matmul(a,b))
-# 
-
+# Teste grande: 
 torch.manual_seed(0)
+
 a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
 b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
+
 triton_output = matmul(a, b, 16)
 torch_output = torch.matmul(a, b)
 
 print(triton_output)
 print(torch_output)
-print(torch.allclose(triton_output, torch_output))
-#if torch.allclose(triton_output, torch_output, atol=5e-2, rtol=0):
-#    print("✅ Triton and Torch match")
-#else:
-#    print("❌ Triton and Torch differ")
+
+if torch.allclose(triton_output, torch_output, atol=5e-2, rtol=0):
+    print("✅ Triton and Torch match")
+else:
+    print("❌ Triton and Torch differ")
