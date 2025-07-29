@@ -327,6 +327,8 @@ def forward_kernel_causal_and_sparse(
 
     # # take care of the selected kv blocks
 
+    # Calcula os ponteiros de memória para acessar
+    # os dados de seleção
     kv_block_indices_ptrs = (
         kv_block_indices +
         off_b * stride_kvbl_b +
@@ -341,16 +343,25 @@ def forward_kernel_causal_and_sparse(
         offs_m * stride_kvbl_m
     )
 
+    # Muda de (BLOCK * QUERY_HEAD_GROUPS, BLOCK_HEADDIM) para (BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
     q = q.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
+    # Transforma em (BLOCK, QUERY_HEAD_GROUPS, 1, BLOCK_HEADDIM)
     q = tl.expand_dims(q, 2)
+    # Coloca QUERY_EXPAND_DIM na dimensão criada
     q = tl.broadcast_to(q, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+    # Habilita operação de dot product com o tensor k
     q = q.reshape(BLOCK, 16, BLOCK_HEADDIM)
 
+    #carrega cada indice de cada bloco de seleção para um determinado token de acordo com o kv_block_ptrs
     for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
 
+        # begin carrega os índices e as máscaras
         block_indices = tl.load(
+            # kv_block_indices_ptrs são os ponteiros para os 
+            # blocos comprimidos, então, aqui estamos pegando um bloco atual 
             kv_block_indices_ptrs + off_sel_kv_block,
             mask = offs_m < seqlen_q,
+            # Funciona como um padding, caso o valor do índice seja 0
             other = 0
         )
 
@@ -359,14 +370,18 @@ def forward_kernel_causal_and_sparse(
             mask = offs_m < seqlen_q,
             other = False
         )
+        
+        # end carrega os índices e as máscaras
 
+        # a partir do indices do bloco que pegamos na iteração do for anterior, atualizamos os offsets para pegar todos os tokens daquele bloco
+        #block_indices vira uma matriz de linhas, que representa os tokens de seleção que vamos usar
         for off_blocks_per_sel in range(NUM_BLOCKS_PER_SEL):
-
+            #criação dos offsets para a matriz de NxDim, como estamos trabalhando com Q em bloco, a matriz deve ter [M,N,Dim] (M representa a sequencia de queries)
             blocks_offs_n = (
                 block_indices[:, None] * (BLOCK * NUM_BLOCKS_PER_SEL) +
                 tl.arange(0, BLOCK)[None, :] + (off_blocks_per_sel * BLOCK)
             )
-
+            #cria os ponteiros de k/v com base nos tokens selecionados para cada token da sequencia, nesse caso para o bloco de queries
             block_k_ptrs = (
                 K +
                 off_b * stride_kb +
@@ -384,6 +399,7 @@ def forward_kernel_causal_and_sparse(
             )
 
             # load k of shape (m, n, d), sparsely selected by each query
+            #matriz k (m,n,d) com tokens esparsos para cada query, que representa os tokens da sequencia
 
             k_block = tl.load(
                 block_k_ptrs,
@@ -391,20 +407,30 @@ def forward_kernel_causal_and_sparse(
                 other = 0.
             )
 
-            # similarities
+            #calculo do softmax entre qk(t)
 
-            block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32)
+            # begin attention scores
+            
+            # Inicializa os tensores de bloco de atenção 
+            block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32) #matriz mxm           
             sel_qk = tl.zeros([BLOCK, QUERY_HEAD_GROUPS, BLOCK], dtype = tl.float32)
 
+            # Transposição do tensor K
             k_block = k_block.reshape(BLOCK, BLOCK, BLOCK_HEADDIM)
             k_block = k_block.permute(0, 2, 1)
 
+            # Cálculo do produto intenro qk
             block_qk += tl.dot(q, k_block)
+            
+            # Separa os grupos de query
             block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
             block_qk = tl.reduce(block_qk, 2, reduce_avg)
 
             sel_qk += block_qk
             sel_qk += tl.where(block_masks[:, None, None], 0, float("-inf"))
+            #se o bloco selecionado contiver tokens futuros ao token atual da sequencia
+
+            # end attention scores
 
             # attention
 
@@ -420,6 +446,7 @@ def forward_kernel_causal_and_sparse(
 
             # aggregate values
 
+            # begin agregação 
             v_block = tl.load(
                 block_v_ptrs,
                 mask = blocks_offs_n[:, :, None] < seqlen_k,
@@ -439,6 +466,8 @@ def forward_kernel_causal_and_sparse(
             block_acc_o = tl.reduce(block_acc_o, 2, reduce_avg)
 
             acc_o += block_acc_o
+
+            # end agregação
 
             # -- update statistics
 
@@ -539,6 +568,7 @@ def forward_kernel(
     INCLUDE_BLOCK_CAUSAL: tl.constexpr,
     RETURN_SLIDING_OUT: tl.constexpr
 ):
+    #Verifica se usaremos janela deslizante
     if RETURN_SLIDING_OUT:
         sliding = tl.program_id(2) == 0
         out_ptr = SlidingOut if sliding else Out
@@ -548,7 +578,7 @@ def forward_kernel(
         sliding = False
         out_ptr = Out
         lse_ptr = Lse
-        num_sel_kv_blocks = NUM_SEL_KV_BLOCKS
+        num_sel_kv_blocks = NUM_SEL_KV_BLOCKS #TOP-K blocos
 
     forward_kernel_causal_and_sparse(
         Q,
@@ -605,17 +635,22 @@ def native_sparse_attn_forward(
     block_size = 128,
     include_block_causal = True,
     return_sliding_window_out = False
-):
+): # verifica contiguidade na memoria
     q, k, v, kv_block_indices = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v, kv_block_indices)]
 
+    # dim de Q [b,hq,seqlen_q, dim]
     batch, nheads, seqlen_q, dim, device = *q.shape, q.device
+    # dim de K[b,H, seqlen_k,dim]
     _, kv_heads, seqlen_k, _ = k.shape
-    assert divisible_by(nheads, kv_heads)
-    head_groups = nheads // kv_heads
+    assert divisible_by(nheads, kv_heads) #verifica se HQ é divisivel por KV heads
+    head_groups = nheads // kv_heads # HeadGroups por query
 
     assert divisible_by(block_size, 16)
 
+
+    #numero de blocos por seleção????w
     num_blocks_per_sel = block_size // 16
+    #topk
     num_selected_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
 
@@ -626,22 +661,22 @@ def native_sparse_attn_forward(
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert all([t.is_cuda for t in (q, k, v)])
 
-    softmax_scale = dim ** -0.5
+    softmax_scale = dim ** -0.5 #scale é 1 sobre a raiz da dimensao
 
-    seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
+    seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE) #como assim seqlen_q?
 
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
     slide_lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
-    o = torch.empty_like(q)
-    slide_o = torch.empty_like(q)
+    o = torch.empty_like(q) #output [b,hq, seqlen_q, dim ]
+    slide_o = torch.empty_like(q) #sliding window [b, hq, seqlen_q, dim]
 
-    BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
+    BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16) #tamanho da dimensao
     num_warps = 4 if dim <= 64 else 8
 
     grid = lambda META: (
-        triton.cdiv(seqlen_q, META["BLOCK"]),
-        batch * kv_heads,
+        triton.cdiv(seqlen_q, META["BLOCK"]), #tamanho da sequencia de tokens pelo tamanho dos blocos dentro do kernel
+        batch * kv_heads, #batch e kv heads
         (2 if return_sliding_window_out else 1)
     ) # kv heads here, as grouped query heads all loaded, following the paper
 
@@ -657,7 +692,7 @@ def native_sparse_attn_forward(
         slide_lse,
         softmax_scale,
         q.stride(0),
-        q.stride(1),
+        q.stride(1), 
         q.stride(2),
         k.stride(0),
         k.stride(1),
@@ -785,7 +820,6 @@ def backward_store_dk_dv(
         else:
             tl.atomic_add(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
             tl.atomic_add(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
-
 
 @triton.jit
 def backward_kernel_one_col_block_sparse(
@@ -1835,14 +1869,22 @@ class NSA(Function):
         block_dk_dv_use_dot,
         return_sliding_window_out
     ):
-        dtype = fq.dtype
-
         q_heads, kv_heads = fq.shape[1], fk.shape[1]
         assert divisible_by(q_heads, kv_heads)
         head_groups = q_heads // kv_heads
 
+        # Guarda tipo de dados
+        dtype = fq.dtype
+
+        # Retorna tipo de dados
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
+        # Q [B, HQ,N, Dim]
+        # K [B, H, N, Dim]
+        # V [B, H, N, Dim]
+        # Out [B, HQ, N, Dim]
+
+        # Chama o native_sparse_attn_forward e recebe todas as saídas
         out, slide_out, lse, slide_lse = native_sparse_attn_forward(
             fq, fk, fv,
             selected_block_indices,
@@ -1851,6 +1893,8 @@ class NSA(Function):
             include_block_causal = include_block_causal,
             return_sliding_window_out = return_sliding_window_out
         )
+
+        # Coisas relacionadas ao backward pass:
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, slide_out, lse, slide_lse)
 
@@ -1935,31 +1979,49 @@ _native_sparse_attend = NSA.apply
 # sel - selected indices
 
 def native_sparse_attend(
+    # Query tensor: (batch_size, query_heads, sequence_length, head_dimension)
     fq: Float['b qh n d'],
+    # Key tensor: (batch_size, key_heads, sequence_length, head_dimension)
+    # (kh <= qh devido à técnica de Grouped-Query Attention)
     fk: Float['b kh n d'],
+    # Value tensor: (batch_size, key_heads, sequence_length, head_dimension)
+    # (kv = kh)
     fv: Float['b kh n d'],
+    # Tamanho de cada bloco de atenção (para compressão e seleção?)
     block_size: int,
+    # Índices dos sel blocos de atenção que serão selecionados
     selected_block_indices: Int['b qh n sel'] | Int['b kh n sel'],
+    # Máscara relacionada aos índices, mas, não entendi muito bem, ainda.
+    # ou o seu uso
     fmask: Bool['b qh n sel'] | Bool['b kh n sel'],
+    # Fator opcional de escalação para cada bloco (dos pontos de importância, engraçado)
     sel_scale: Float['b kh n sel'] | Float['b qh n sel'] | None = None,
+    # Inclui ou não uma máscara para atenção que usa blocos
     include_block_causal = True,
+    # Retorna ou não Log-sum-exp de pontos de atenção
+    # (requerido para computação de gradiente e análise de attention)
     return_lse = False,
+    # tem a ver com o backward pass
     block_dk_dv_use_dot = False,
+    # Retorna ou não attention do sliding window como output separado
     return_sliding_window_out = False
 ):
+    # tamahho da sequência: n 
     seq_len = fq.shape[-2]
+    # número de cabeças para queries, grupos kv, índices de blocos selecionados
     q_heads, kv_heads, sel_heads = fq.shape[1], fk.shape[1], selected_block_indices.shape[1]
 
     assert divisible_by(q_heads, kv_heads)
+    # Importante: número de blocos selecionados precisa ser o mesmo que queries ou kv
     assert sel_heads in (q_heads, kv_heads)
-
     assert block_size >= 16, 'fine selection block size must be 16 or greater for now'
 
-    # query heads within each group to attend to different segments
 
+    # query heads within each group to attend to different segments
     if kv_heads != sel_heads:
         fk, fv = tuple(repeat(t, 'b h ... -> b (h gh) ...', gh = q_heads // kv_heads) for t in (fk, fv))
 
+    # Calcula o NSA com os parâmetros montados e recebe as saídas
     out, sliding_out, lse, sliding_lse = _native_sparse_attend(
         fq, fk, fv,
         block_size,
@@ -1970,6 +2032,8 @@ def native_sparse_attend(
         block_dk_dv_use_dot,
         return_sliding_window_out
     )
+
+    # daqui para baixo: monta a saída
 
     if return_sliding_window_out:
         out = (out, sliding_out)

@@ -41,7 +41,6 @@ y: Float["batch seq dim"]
 ### 3. `compress_networks.py`
 Uma coleção de redes neurais que podem ser usadas na branch de compressão de tokens. 
 Lembrando, cada bloco de tokens é comprimido em um único valor a partir de alguma dessas redes neurais.
-#### ConvLinearCompress
 
 ## Estratégias 
 ### Coarse-grained token compression

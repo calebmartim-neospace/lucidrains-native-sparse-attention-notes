@@ -188,9 +188,9 @@ def attend(
 class SparseAttention(Module):
     def __init__(
         self,
-        dim,
-        dim_head,
-        heads,
+        dim, # d
+        dim_head, # d / h
+        heads, # h
         sliding_window_size,
         compress_block_size,
         compress_block_sliding_stride,
@@ -211,71 +211,80 @@ class SparseAttention(Module):
 
         # attention heads
         # handling gqa if `kv_heads` is set
-
         kv_heads = default(kv_heads, heads)
-        assert kv_heads <= heads and divisible_by(heads, kv_heads)
+        assert divisible_by(heads, kv_heads)
 
         self.heads = heads
         self.dim_head = dim_head
         self.kv_heads = kv_heads
-        self.num_grouped_queries = heads // kv_heads
+        self.num_grouped_queries = heads // kv_heads 
 
         # scale
-
         self.scale = dim_head ** -0.5
 
-        dim_inner = dim_head * heads
-        dim_kv_inner = dim_head * kv_heads
+        # Forma da matriz Q (quantas cabeças serão usadas para cada query e quantos elementos cada vetor tem)
+        dim_inner = dim_head * heads 
+        # Forma da matriz K e V (mesma lógica)
+        dim_kv_inner = dim_head * kv_heads 
 
+        # Normalização das projeções para evitar perda ou explosão de gradientes 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
 
-        # autoregressive or not - will extend this work for long context video / genomics use-cases
-
+        # Auto regressivo ou não
         self.causal = causal
 
-        # rotary
-
+        # Embedding rotatório
         self.rotary_emb = RotaryEmbedding(dim_head)
 
         # qkv
+        # Elementos totais nas matrizes Q, K e V
+        self.qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+        # Criação da projeção
+        self.to_qkv = nn.Linear(dim, sum(self.qkv_split), bias = False)
 
-        qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
-
-        self.to_qkv = nn.Linear(dim, sum(qkv_split), bias = False)
-
-        self.qkv_split = qkv_split
-
-        # sliding window strategy
-
+        # Estratégia de sliding window 
         self.sliding_window = LocalAttention(
+            # dim_head porque estamos tratando dos tokens já projetados
             dim = dim_head,
             window_size = sliding_window_size,
             causal = causal,
+            # tamanho da janela não varia dependendo da posição do token
             exact_windowsize = True,
+            # automaticamente faz um padding, caso a posição do token seja 
+            # pequena demais
             autopad = True,
+            # embedding já é lidado pelo módulo
             use_rotary_pos_emb = False
         )
 
+        # transformer.py:158 sugere sliding_window_size = 32
         self.sliding_window_size = sliding_window_size
 
-        # compress strategy
-
+        # Estratégia de compressão
         self.compress_block_size = compress_block_size
         self.compress_block_sliding_stride = compress_block_sliding_stride
         assert self.compress_block_size >= self.compress_block_sliding_stride, 'compress_block_size must be >= compress_block_sliding_stride'
         assert self.compress_block_sliding_stride > 0, 'compress_block_sliding_stride must be greater than 0'
-        assert divisible_by(selection_block_size, self.compress_block_sliding_stride), f'selection_block_size {selection_block_size} must be divisible by compress_block_sliding_stride {self.compress_block_sliding_stride}'
+        assert divisible_by(selection_block_size, compress_block_sliding_stride), f'selection_block_size {selection_block_size} must be divisible by compress_block_sliding_stride {compress_block_sliding_stride}'
 
         # Compression window splitting
+        # Transforma os tensors K e V em janelas que se sobrepõe de compressão 
         self.split_compress_window = nn.Sequential(
+            # Trata cada uma das (b*h) cabeças como independentes para realizar 
+            # uma convolução 2d:
             Rearrange('b h n d -> (b h) d 1 n'),
+            # Padding à esquerda de cada sequência:
             nn.ZeroPad2d(((compress_block_size - compress_block_sliding_stride), 0, 0, 0)),
+            # Faz o split em si das janelas que se sobrepõe
             nn.Unfold(kernel_size=(1, self.compress_block_size), stride=(1, self.compress_block_sliding_stride)),
+            # Transforma de volta para (batch, heads, num_windows, compress_block_size, dim_head)
             Rearrange('(b h) (d n) w -> b h w n d', d=dim_head, h=kv_heads, n=self.compress_block_size)
         )
 
         assert num_compressed_mem_kv > 0
         self.num_mem_compress_kv = num_compressed_mem_kv
+        # Cria a memória para o par kv comprimido com forma (2, kv_heads, num_compressed_mem_kv, dim_head)
+        # num_compressed_mem_kv é o número de tokens comprimidos
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
         
         self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, self.compress_block_size, dim_head))
@@ -328,12 +337,12 @@ class SparseAttention(Module):
 
         # split and merging heads
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
-        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head) # Simplesmente divide d caras em (h * D) caras
+        self.merge_heads = Rearrange('b h n d -> b n (h d)') # Junta a sequência
 
         # combining heads
 
-        self.combine_heads = nn.Linear(dim_inner, dim, bias = False)
+        self.combine_heads = nn.Linear(dim_inner, dim, bias = False) # Projeta de D para d
 
     def forward_inference(
         self,
@@ -441,8 +450,10 @@ class SparseAttention(Module):
 
         # 2. fine attention inference
 
+        # Extrai os pontos de importância da matriz de similaridade de atenção comprimida
         importance_scores = csim[..., self.num_mem_compress_kv:]
 
+        # Número de blocos comprimidos
         num_compress_blocks = importance_scores.shape[-1]
         num_compress_per_fine = self.selection_block_size // self.compress_block_sliding_stride
 
@@ -649,6 +660,8 @@ class SparseAttention(Module):
 
         # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
 
+        # csim tem forma (batch, heads, seq_len, num_compressed_tokens), é os pontos de importância 
+        # da atenção
         importance_scores = csim[..., num_mem_compress_kv:]
 
         num_selected = min(self.num_selected_blocks, num_compress_blocks)
@@ -656,9 +669,10 @@ class SparseAttention(Module):
 
         # maybe average the compressed attention across each grouped queries (per key / values)
 
+        # Lidando com GQA
         if self.query_heads_share_selected_kv:
+            # reduz as cópias feitas
             importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
-
             fine_num_grouped_queries = self.num_grouped_queries
         else:
             fine_num_grouped_queries = 1
